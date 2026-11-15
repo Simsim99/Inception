@@ -1,0 +1,216 @@
+networks:
+# i make a wifi virtal router named inception network that uses
+# the driver bridge that is always used when we have multi
+# containers on a single host in order to establish connection 
+# between them in a secure private network away from the 
+# host and the internet since their poets are not exposed, 
+# the only port we use is web server's
+  inception-network:
+    driver: bridge
+
+volumes: # volumes = persistent_folders on the hard drive
+  mariadb_data:
+  # driver: local tells docker to create this shared persistent folder on our own computer's
+  # physical hard drive, rather than on a remote network or cloud drive
+  # "Use the host machine's own filesystem to store this data"
+    driver: local
+    driver_opts:
+    # "This path (/home/ouchouir/data/mariadb) is already right here on the machine's own
+    #hard drive. It's not a USB stick, not a separate hard drive partition, and not a
+    # network server—so don't look for any special hardware driver (type: none). Just link this local folder directly."
+      type: none
+    # bind: link the updated data layer to a machine folder out 
+    # of container on the host (home/ouchouir/data/mariadb) so we won't lose it
+    # hatever MariaDB writes to /var/lib/mysql inside the container instantly appears inside
+    # /home/ouchouir/data/mariadb on your physical drive.
+      o: bind
+    # device specifies the exact path on host machine where 
+    # the persistent folder lives
+    # Maps /var/lib/mysql(check services at the bottom) inside the container directly to
+    # /home/ouchouir/data/mariadb on your VM host in case conatiner got destroyed.
+      device: /home/ouchouir/data/mariadb
+
+  wp_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /home/ouchouir/data/wordpress
+  
+  portainer_data:
+
+secrets:
+# db_password and db_root_password load password files from outside the container,
+# docker manager reads them and stores them temporarily in the container RAM 
+# as read-only files at /run/secrets/ to use them securely
+# Docker Secrets keep your passwords encrypted in memory and off
+# your disk inside the running container.
+  db_password:
+    file: ../secrets/db_password.txt
+  db_root_password:
+    file: ../secrets/db_root_password.txt
+  credentials:
+    file: ../secrets/credentials.txt
+  ftp_password:
+    file: ../secrets/ftp_password.txt
+  ftp_user:
+    file: ../secrets/ftp_user.txt
+
+services:
+  mariadb:
+  # build tells docker compose to go find our custom Dockerfile 
+  # in ./requirements/mariadb/ and build the container image from scratch
+    build: ./requirements/mariadb
+    image: mariadb # name of the image
+  # container_name gives an exact hostname so docker makes a virtual DNS server 
+  # that turns "mariadb" into a dynamic IP address automatically whenever 
+  # another container service wants to connect
+    container_name: mariadb
+  # on failure : re run id database container crashes automativally
+  # if i manually stop it(docker stop), do NOT re-run
+    restart: on-failure
+  # env_file loads non-sensitive configuration settings from .env 
+  # into container environment variables so data is not hardcoded
+    env_file:
+      - .env
+  # secrets gives mariadb service access to the locked briefcases in RAM
+    secrets:
+      - db_password
+      - db_root_password
+  # plugs our local volume specifically into  the host's /var/lib/mysql because that is 
+  # the hardcoded folder where mariadb naturally writes all its raw database tables
+  # this way if the container gets detroyed, the data stays safe on my machine
+    volumes:
+      - mariadb_data:/var/lib/mysql
+  # connects mariadb container to our private bridge network to listen
+  # for incoming connections from WordPress
+    networks:
+      - inception-network
+  wordpress:
+    build: ./requirements/wordpress
+    image: wordpress
+    container_name: wordpress
+    restart: on-failure
+    env_file:
+      - .env
+    secrets:
+      - db_password
+      - db_root_password
+      - credentials
+    volumes:
+      - wp_data:/var/www/html
+    networks:
+      - inception-network
+    # new concept:
+    #  This tells Docker Compose: "Do not even attempt to start the WordPress
+    #container until the MariaDB container is up and running.
+    # "This prevents WordPress from crashing on startup because the database
+    # wasn't ready yet:
+    depends_on:
+      - mariadb
+      - redis
+
+  nginx:
+    build: ./requirements/nginx
+    image: nginx
+    container_name: nginx
+    restart: on-failure
+    # Maps host port 443 (the default port for HTTPS traffic on your host machine or VM)
+    # to port 443 inside the NGINX container (HOST_PORT:CONTAINER_PORT).
+    # MariaDB and WordPress do not expose any ports to the outside world—they sit isolated
+    # inside inception-network. NGINX is the sole entrypoint into your entire architecture.
+    # Exposing port 443 allows external clients (like a web browser on your host machine)
+    # to establish secure HTTPS connections directly with NGINX.
+    ports:
+      - "443:443"
+    # mounts the existing wp_data persistent volume into NGINX at /var/www/html—the exact
+    # same directory where WordPress stores its core files.
+    # When a user requests static assets (such as .css, .js, or image files), NGINX reads them
+    # directly from /var/www/html on the disk and returns them immediately. It skips sending those
+    # static requests to WordPress (PHP-FPM), saving processing overhead and serving assets much faster.
+    volumes:
+      - wp_data:/var/www/html
+    # Attaches NGINX to your private inception-network bridge and establishes a startup sequence ordering via depends_on
+    # Connecting to inception-network allows NGINX to forward dynamic PHP requests over the network to wordpress:9000
+    networks:
+      - inception-network
+    depends_on:
+      - wordpress
+  adminer:
+    # Build from the bonus/adminer folder
+    build: ./requirements/bonus/adminer
+    image: adminer
+    container_name: adminer
+    # Restart if it crashes
+    restart: on-failure
+    # No volumes needed! Adminer is stateless. It doesn't save any data itself; it just queries MariaDB to display it.
+    # No ports needed! NGINX will act as the traffic cop and forward /adminer requests to this container on port 9000 over the private network.
+    networks:
+      - inception-network
+    # Wait for MariaDB to start. If Adminer starts first, it will run, but you wouldn't be able to log in until MariaDB is awake.
+    depends_on:
+      - mariadb
+  static-website:
+    # Build from the bonus/static folder
+    build: ./requirements/bonus/static
+    image: static-website
+    # The name is critical! Docker's internal DNS server uses this name to assign a virtual IP so the main NGINX can route traffic to it.
+    container_name: static-website
+    # Restart if it crashes
+    restart: on-failure
+    # Must be on the inception-network so the main NGINX container can talk to it privately.
+    networks:
+      - inception-network
+    # OMITTED volumes: The HTML file is baked into the Image during Build Time. It never changes at runtime, so we don't need persistent storage.
+    # OMITTED ports: It should stay hidden from the host/internet. Only the main NGINX container talks to it.
+    # OMITTED secrets/env_file: A static HTML file doesn't use passwords or configuration variables.
+    # OMITTED depends_on: It doesn't rely on MariaDB or WordPress to run. It just sits there waiting for the main NGINX to feed it traffic.
+  redis:
+    # Build from the bonus/redis folder
+    build: ./requirements/bonus/redis
+    image: redis
+    # The name is critical! Docker's internal DNS uses this so WordPress can find it at 'redis:6379'.
+    container_name: redis
+    # Restart if it crashes
+    restart: on-failure
+    # Must be on the inception-network so the WordPress container can talk to it privately.
+    networks:
+      - inception-network
+    # OMITTED volumes: Redis lives in RAM (volatile memory). If it crashes, the cache is wiped. 
+    # That is fine! It is just a temporary cache. MariaDB still holds the real data on the SSD.
+    # OMITTED ports: It stays hidden from the host/internet. Only WordPress needs to talk to it over the private network.
+  portainer:
+    build: ./requirements/bonus/portainer
+    image: portainer
+    container_name: portainer
+    restart: on-failure
+    networks:
+      - inception-network
+    # Exposes port 9000 on the host machine so our browser can connect to the Portainer web UI.
+    # exposing port 9000 on the portainer container with the port 9000 on the host machine
+    ports:
+      - "9000:9000"
+    volumes:
+      # THE MAGIC TRICK: We mount the host's docker.sock file into the container.
+      # Portainer writes API requests to this file, which the Docker Engine reads.
+      # This gives Portainer "King Mode" to control all other containers via a web UI.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Saves Portainer's admin profile and settings so we don't have to recreate the account on every restart.
+      - portainer_data:/data
+  ftp:
+    build: ./requirements/bonus/ftp
+    image: ftp
+    container_name: ftp
+    restart: on-failure
+    networks:
+      - inception-network
+    ports:
+      - "21:21" # control chnnel
+      - "30000-30009:30000-30009" # passive data channel
+    volumes:
+      # When I upload a file via FTP, it writes to this volume. Because WordPress and NGINX also have
+      # this volume mounted, the file instantly appears on your website!
+      - wp_data:/var/www/html
+    secrets:
+      - ftp_password
+      - ftp_user   

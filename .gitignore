@@ -1,0 +1,15 @@
+# Secrets (CRITICAL: Do not push to Git)
+secrets/
+
+# Environment variables (contain usernames, etc.)
+srcs/.env
+
+# TLS certificates (private keys must never be pushed)
+srcs/requirements/nginx/tools/*.crt
+srcs/requirements/nginx/tools/*.key
+
+# OS clutter
+.DS_Store
+
+# Docker leftovers
+*.log
